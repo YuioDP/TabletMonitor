@@ -299,9 +299,12 @@ def single_instance():
 
 def main():
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # escalado por monitor
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
     if not single_instance():
         ctypes.windll.user32.MessageBoxW(
             0, "Tablet Monitor ya esta abierto. Buscalo en los iconos ocultos de la barra de tareas.",
