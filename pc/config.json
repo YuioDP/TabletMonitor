@@ -1,0 +1,9 @@
+{
+  "mode": "usb",
+  "wifi_ip": "192.168.1.50",
+  "port": 5000,
+  "monitor": "auto",
+  "fps": 25,
+  "quality": 70,
+  "adb_path": ""
+}
