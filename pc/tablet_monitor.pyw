@@ -5,6 +5,7 @@ Captura una pantalla de Windows y la envia a la tablet. Vive en la bandeja del
 sistema (iconos ocultos), sin ventana de consola. Doble clic para abrirlo.
 """
 import ctypes
+from ctypes import wintypes
 import io
 import json
 import os
@@ -18,27 +19,31 @@ import time
 try:
     import mss
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageChops, ImageDraw
 except ImportError as _e:
     ctypes.windll.user32.MessageBoxW(
         0, "Faltan librerias. Ejecuta instalar.bat y vuelve a abrir.\n\n" + str(_e),
         "Tablet Monitor", 0x10)
     sys.exit(1)
 
-BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-        else os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    BASE = os.path.dirname(sys.executable)
+else:
+    BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 LOG_PATH = os.path.join(BASE, "log.txt")
 CREATE_NO_WINDOW = 0x08000000
 
 DEFAULTS = {
-    "mode": "usb",            # "usb" o "wifi"
+    "mode": "usb",              # "usb" o "wifi"
     "wifi_ip": "192.168.1.50",  # IP que muestra la tablet (solo modo wifi)
     "port": 5000,
-    "monitor": "auto",        # "auto" = ultimo monitor (el virtual); o un numero (ver_monitores.bat)
+    "monitor": "auto",          # "auto" = ultimo monitor (el virtual); o un numero (ver_monitores.bat)
     "fps": 25,
-    "quality": 70,            # calidad JPEG 10-95
-    "adb_path": "",           # vacio = busca platform-tools\adb.exe junto al script, o adb del PATH
+    "quality": 70,              # calidad JPEG 10-95
+    "fit": "letterbox",         # "letterbox" = barras negras sin deformar; "stretch" = rellena y deforma
+    "cursor": "real",           # "real" = tu puntero actual; "simple" = flecha basica; "none" = sin puntero
+    "adb_path": "",             # vacio = busca platform-tools\adb.exe junto al programa, o adb del PATH
 }
 CFG = dict(DEFAULTS)
 
@@ -84,22 +89,200 @@ def load_config():
         save_config()
 
 
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("La app de la tablet no esta abierta o cerro la conexion")
+        buf += chunk
+    return buf
+
+
+# ---------------------------------------------------------------- cursor (API de Windows)
+
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hCursor", wintypes.HANDLE), ("ptScreenPos", POINT)]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD),
+                ("yHotspot", wintypes.DWORD), ("hbmMask", wintypes.HANDLE),
+                ("hbmColor", wintypes.HANDLE)]
+
+
+class BITMAP(ctypes.Structure):
+    _fields_ = [("bmType", wintypes.LONG), ("bmWidth", wintypes.LONG),
+                ("bmHeight", wintypes.LONG), ("bmWidthBytes", wintypes.LONG),
+                ("bmPlanes", wintypes.WORD), ("bmBitsPixel", wintypes.WORD),
+                ("bmBits", wintypes.LPVOID)]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+user32 = None
+gdi32 = None
+if sys.platform == "win32":
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+    user32.GetCursorInfo.restype = wintypes.BOOL
+    user32.GetIconInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(ICONINFO)]
+    user32.GetIconInfo.restype = wintypes.BOOL
+    user32.DrawIconEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_int, wintypes.HANDLE,
+                                  ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.HANDLE,
+                                  wintypes.UINT]
+    user32.DrawIconEx.restype = wintypes.BOOL
+    user32.GetDC.argtypes = [wintypes.HANDLE]
+    user32.GetDC.restype = wintypes.HANDLE
+    user32.ReleaseDC.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HANDLE]
+    gdi32.CreateCompatibleDC.restype = wintypes.HANDLE
+    gdi32.CreateDIBSection.argtypes = [wintypes.HANDLE, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+                                       ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE,
+                                       wintypes.DWORD]
+    gdi32.CreateDIBSection.restype = wintypes.HANDLE
+    gdi32.SelectObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    gdi32.SelectObject.restype = wintypes.HANDLE
+    gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    gdi32.DeleteDC.argtypes = [wintypes.HANDLE]
+    gdi32.GetObjectW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p]
+
+
 def cursor_pos():
     p = POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+    user32.GetCursorPos(ctypes.byref(p))
     return p.x, p.y
+
+
+def cursor_state():
+    """(x, y, hcursor) o None si el puntero esta oculto."""
+    ci = CURSORINFO()
+    ci.cbSize = ctypes.sizeof(CURSORINFO)
+    if user32.GetCursorInfo(ctypes.byref(ci)):
+        if not (ci.flags & 1):  # CURSOR_SHOWING
+            return None
+        return ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor
+    x, y = cursor_pos()
+    return x, y, None
+
+
+def _delete(h):
+    if h:
+        gdi32.DeleteObject(h)
+
+
+def _render_cursor(hcursor, w, h, white):
+    """Dibuja el puntero sobre fondo negro o blanco y devuelve una imagen RGB."""
+    hdc_screen = user32.GetDC(None)
+    hdc = gdi32.CreateCompatibleDC(hdc_screen)
+    try:
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h  # de arriba hacia abajo
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bits = ctypes.c_void_p()
+        hbm = gdi32.CreateDIBSection(hdc_screen, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        if not hbm or not bits.value:
+            raise OSError("CreateDIBSection fallo")
+        try:
+            old = gdi32.SelectObject(hdc, hbm)
+            size = w * h * 4
+            ctypes.memset(bits.value, 0xFF if white else 0x00, size)
+            user32.DrawIconEx(hdc, 0, 0, hcursor, w, h, 0, None, 3)  # DI_NORMAL
+            gdi32.GdiFlush()
+            raw = ctypes.string_at(bits.value, size)
+            gdi32.SelectObject(hdc, old)
+        finally:
+            gdi32.DeleteObject(hbm)
+    finally:
+        gdi32.DeleteDC(hdc)
+        user32.ReleaseDC(None, hdc_screen)
+    return Image.frombytes("RGB", (w, h), raw, "raw", "BGRX")
+
+
+_sprites = {}
+
+
+def get_sprite(hcursor):
+    """(sobre_negro, transparencia_invertida, hotspot_x, hotspot_y) o None."""
+    if hcursor in _sprites:
+        return _sprites[hcursor]
+    sprite = None
+    try:
+        ii = ICONINFO()
+        if user32.GetIconInfo(hcursor, ctypes.byref(ii)):
+            try:
+                bm = BITMAP()
+                src = ii.hbmColor or ii.hbmMask
+                gdi32.GetObjectW(src, ctypes.sizeof(BITMAP), ctypes.byref(bm))
+                w = bm.bmWidth
+                h = bm.bmHeight if ii.hbmColor else bm.bmHeight // 2
+            finally:
+                _delete(ii.hbmColor)
+                _delete(ii.hbmMask)
+            if 0 < w <= 256 and 0 < h <= 256:
+                black = _render_cursor(hcursor, w, h, False)
+                white = _render_cursor(hcursor, w, h, True)
+                diff = ImageChops.subtract(white, black)  # = 255 * (1 - alfa)
+                sprite = (black, diff, int(ii.xHotspot), int(ii.yHotspot))
+    except Exception as e:
+        log("cursor: no pude leer el puntero: %r" % (e,))
+    if len(_sprites) > 64:
+        _sprites.clear()
+    _sprites[hcursor] = sprite
+    return sprite
+
+
+def paste_cursor(img, sprite, px, py):
+    black, diff, hx, hy = sprite
+    x0, y0 = px - hx, py - hy
+    w, h = black.size
+    cx0, cy0 = max(0, x0), max(0, y0)
+    cx1, cy1 = min(img.width, x0 + w), min(img.height, y0 + h)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return
+    box = (cx0 - x0, cy0 - y0, cx1 - x0, cy1 - y0)
+    region = img.crop((cx0, cy0, cx1, cy1))
+    out = ImageChops.add(ImageChops.multiply(region, diff.crop(box)), black.crop(box))
+    img.paste(out, (cx0, cy0))
 
 
 ARROW = [(0, 0), (0, 16), (4, 12), (7, 19), (10, 18), (7, 11), (12, 11)]
 
 
-def draw_cursor(img, cx, cy, mon, tw, th):
-    x = int((cx - mon["left"]) * tw / mon["width"])
-    y = int((cy - mon["top"]) * th / mon["height"])
+def draw_cursor(img, mode, st, mon, fw, fh, ox, oy):
+    if mode == "none" or st is None:
+        return
+    cx, cy, hc = st
+    x = ox + int((cx - mon["left"]) * fw / mon["width"])
+    y = oy + int((cy - mon["top"]) * fh / mon["height"])
+    try:
+        sprite = get_sprite(hc) if (mode == "real" and hc) else None
+        if sprite is not None:
+            paste_cursor(img, sprite, x, y)
+            return
+    except Exception as e:
+        log("cursor: error al dibujar: %r" % (e,))
     pts = [(x + px, y + py) for px, py in ARROW]
     ImageDraw.Draw(img).polygon(pts, fill=(255, 255, 255), outline=(0, 0, 0))
 
@@ -109,14 +292,14 @@ def inside(mon, cx, cy):
             and mon["top"] <= cy < mon["top"] + mon["height"])
 
 
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("La app de la tablet no esta abierta o cerro la conexion")
-        buf += chunk
-    return buf
+def fit_size(sw, sh, tw, th, mode):
+    """Tamano con el que se dibuja la captura dentro de la tablet y su desplazamiento."""
+    if mode == "stretch":
+        return tw, th, 0, 0
+    s = min(tw / sw, th / sh)
+    w = max(1, int(round(sw * s)))
+    h = max(1, int(round(sh * s)))
+    return w, h, (tw - w) // 2, (th - h) // 2
 
 
 # ---------------------------------------------------------------- ADB (USB)
@@ -145,7 +328,7 @@ def ensure_usb(port):
         adb_run(["start-server"], capture=False, timeout=25)
         r = adb_run(["devices"])
     except FileNotFoundError:
-        raise RuntimeError("No encuentro adb.exe (copia platform-tools junto al script)")
+        raise RuntimeError("No encuentro adb.exe (copia platform-tools junto al programa)")
     states = []
     for line in r.stdout.splitlines():
         parts = line.split()
@@ -233,11 +416,13 @@ class Streamer:
     def _stream(self, sock, tw, th, stop, rep):
         fps = max(1, min(60, int(CFG["fps"])))
         quality = max(10, min(95, int(CFG["quality"])))
+        fit = str(CFG.get("fit", "letterbox")).strip().lower()
+        cmode = str(CFG.get("cursor", "real")).strip().lower()
         interval = 1.0 / fps
         with mss.mss() as sct:
             mon, desc = pick_monitor(sct)
             rep("live", "Transmitiendo %s -> tablet %dx%d" % (desc, tw, th))
-            log("transmitiendo %s %s -> %dx%d" % (desc, mon, tw, th))
+            log("transmitiendo %s %s -> %dx%d (fit=%s, cursor=%s)" % (desc, mon, tw, th, fit, cmode))
             last_raw = None
             last_cur = None
             last_frame = None
@@ -246,8 +431,11 @@ class Streamer:
                 t0 = time.perf_counter()
                 shot = sct.grab(mon)
                 raw = shot.bgra
-                cx, cy = cursor_pos()
-                cur = (cx, cy) if inside(mon, cx, cy) else None
+
+                st = cursor_state() if cmode != "none" else None
+                if st is not None and not inside(mon, st[0], st[1]):
+                    st = None
+                cur = (st[0], st[1], st[2]) if st is not None else None
 
                 if raw == last_raw and cur == last_cur and last_frame is not None:
                     # nada cambio: reenviar el ultimo cuadro cada ~1 s (detecta desconexiones)
@@ -256,13 +444,22 @@ class Streamer:
                         last_send = time.perf_counter()
                     stop.wait(0.03)
                     continue
-
                 last_raw, last_cur = raw, cur
-                img = Image.frombytes("RGB", shot.size, raw, "raw", "BGRX")
-                if shot.size != (tw, th):
-                    img = img.resize((tw, th), Image.BILINEAR)
-                if cur is not None:
-                    draw_cursor(img, cx, cy, mon, tw, th)
+
+                sw, sh = shot.width, shot.height
+                fw, fh, ox, oy = fit_size(sw, sh, tw, th, fit)
+                img = Image.frombytes("RGB", (sw, sh), raw, "raw", "BGRX")
+                if (fw, fh) != (sw, sh):
+                    f = min(sw // fw, sh // fh)
+                    if f >= 2:
+                        img = img.reduce(f)  # reduccion rapida antes del ajuste fino
+                    img = img.resize((fw, fh), Image.BILINEAR)
+                if (fw, fh) != (tw, th):
+                    canvas = Image.new("RGB", (tw, th), (0, 0, 0))
+                    canvas.paste(img, (ox, oy))
+                    img = canvas
+                draw_cursor(img, cmode, st, mon, fw, fh, ox, oy)
+
                 buf = io.BytesIO()
                 img.save(buf, "JPEG", quality=quality)
                 data = buf.getvalue()
