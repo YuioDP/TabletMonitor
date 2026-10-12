@@ -34,3 +34,32 @@ jobs:
         with:
           name: TabletMonitor-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  build-pc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Instalar librerias
+        run: pip install mss pillow pystray pyinstaller
+
+      - name: Crear el .exe
+        run: |
+          Copy-Item pc/tablet_monitor.pyw pc/tablet_monitor.py
+          pyinstaller --onefile --noconsole --name TabletMonitor --hidden-import pystray._win32 pc/tablet_monitor.py
+
+      - name: Descargar platform-tools (adb)
+        run: |
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TabletMonitor-PC
+          path: |
+            dist/TabletMonitor.exe
+            dist/platform-tools
