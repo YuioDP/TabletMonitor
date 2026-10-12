@@ -25,7 +25,8 @@ except ImportError as _e:
         "Tablet Monitor", 0x10)
     sys.exit(1)
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 LOG_PATH = os.path.join(BASE, "log.txt")
 CREATE_NO_WINDOW = 0x08000000
